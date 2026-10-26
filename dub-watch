@@ -4,6 +4,7 @@ import http.server
 import json
 import os
 import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -128,17 +129,33 @@ def setup():
         answer = input(f"{question} [{current}]: " if current else f"{question}: ").strip()
         return answer or current
 
-    config = {
-        "username": ask("MAL username", "username"),
-        "client_id": ask("MAL client ID", "client_id"),
-        "client_secret": ask("MAL client secret (leave empty for app type 'other')", "client_secret"),
-        "animeschedule_token": ask("AnimeSchedule application token (optional, Enter to skip)",
-                                   "animeschedule_token"),
-        "callback_port": int(ask("Login callback port", "callback_port", DEFAULT_CALLBACK_PORT)),
-    }
+    config = {"username": ask("MAL username", "username")}
+    while True:
+        answer = ask("Login callback port", "callback_port", DEFAULT_CALLBACK_PORT)
+        if not str(answer).isdigit() or not 1024 <= int(answer) <= 65535:
+            print("Enter a number between 1024 and 65535.")
+            continue
+        config["callback_port"] = int(answer)
+        if port_is_free(config["callback_port"]):
+            break
+        print(f"Port {answer} is already in use by another program, pick another one.")
+    print(f"\nRegister a MAL API app at https://myanimelist.net/apiconfig (see README).\n"
+          f"Its App Redirect URL must be exactly: {redirect_url(config)}\n")
+    config["client_id"] = ask("MAL client ID", "client_id")
+    config["client_secret"] = ask("MAL client secret (leave empty for app type 'other')", "client_secret")
+    config["animeschedule_token"] = ask("AnimeSchedule application token (optional, Enter to skip)",
+                                        "animeschedule_token")
     save(CONFIG, config, private=True)
-    print(f"Saved {CONFIG}. Your MAL app's redirect URL must be exactly: {redirect_url(config)}")
-    print("Next: dub-watch auth")
+    print(f"Saved {CONFIG}. Next: dub-watch auth")
+
+
+def port_is_free(port):
+    with socket.socket() as probe:
+        try:
+            probe.bind(("localhost", port))
+            return True
+        except OSError:
+            return False
 
 
 def auth(config):

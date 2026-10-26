@@ -74,7 +74,22 @@ Read these before relying on it.
 
 ## Setup
 
-### 1. Register a MAL API app (required)
+### 1. Install
+
+```sh
+git clone https://github.com/NealimeKenna/dub-watch.git
+ln -s "$PWD/dub-watch/dub-watch" ~/.local/bin/dub-watch
+```
+
+### 2. Run setup and register a MAL API app (required)
+
+```sh
+dub-watch setup
+```
+
+Setup asks for your MAL username and the **login callback port** (default 8766). It
+checks that the port is free and then prints the exact redirect URL for your MAL app,
+for example `http://localhost:8766/callback`. Keep setup open and register the app:
 
 Go to <https://myanimelist.net/apiconfig>, click **Create ID** and fill in:
 
@@ -83,32 +98,31 @@ Go to <https://myanimelist.net/apiconfig>, click **Create ID** and fill in:
 | App Name | `Dub Watch` (anything) |
 | App Type | `other` |
 | App Description | e.g. `Personal script that checks my On-Hold list for finished English dubs.` |
-| App Redirect URL | `http://localhost:8766/callback` (must match the port in step 3 exactly) |
+| App Redirect URL | the URL setup printed, exactly (no trailing slash) |
 | Homepage URL | your MAL profile, e.g. `https://myanimelist.net/profile/<username>` |
 | Commercial / Non-Commercial | `non-commercial` |
 | Name / Company Name | your name or username |
 | Purpose of Use | `hobbyist` |
 
-Then open the app and copy the **Client ID**. Keep it private: MAL's API agreement
-does not allow sharing it.
+Then open the app, copy the **Client ID** and paste it into setup. Keep it private:
+MAL's API agreement does not allow sharing it. Leave the client secret empty for app
+type `other`.
 
-### 2. Get an AnimeSchedule token (optional)
+If you change the port later with `dub-watch setup`, change the app's redirect URL to match.
 
-Create an account on <https://animeschedule.net>, then go to **Settings > API**, create an
-application and copy its **application token** (not the client secret).
+### 3. AnimeSchedule token (optional)
 
-### 3. Install and configure
+Setup asks for this last; press Enter to skip. To get one, create an account on
+<https://animeschedule.net>, go to **Settings > API**, create an application and copy its
+**application token** (not the client secret). You can add it later by running
+`dub-watch setup` again; it keeps your other answers.
+
+Then log in to MAL once (for the Move button) and try a dry run:
 
 ```sh
-git clone https://github.com/NealimeKenna/dub-watch.git
-ln -s "$PWD/dub-watch/dub-watch" ~/.local/bin/dub-watch
-dub-watch setup     # MAL username, client ID, optional AnimeSchedule token, callback port
-dub-watch auth      # opens MAL in your browser once, for the Move button
+dub-watch auth      # opens MAL in your browser once
 dub-watch --dry-run # shows the status of every On-Hold show, changes nothing
 ```
-
-If port 8766 is taken on your machine, pick another one in `setup` and change the
-redirect URL of your MAL app to match.
 
 ### 4. Run at login
 
