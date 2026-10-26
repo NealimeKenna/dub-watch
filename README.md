@@ -100,7 +100,7 @@ application and copy its **application token** (not the client secret).
 ### 3. Install and configure
 
 ```sh
-git clone https://github.com/<you>/dub-watch.git
+git clone https://github.com/NealimeKenna/dub-watch.git
 ln -s "$PWD/dub-watch/dub-watch" ~/.local/bin/dub-watch
 dub-watch setup     # MAL username, client ID, optional AnimeSchedule token, callback port
 dub-watch auth      # opens MAL in your browser once, for the Move button
