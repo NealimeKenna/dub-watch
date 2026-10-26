@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+import base64
+import http.server
+import json
+import os
+import secrets
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import webbrowser
+from datetime import date, datetime, timedelta, timezone
+
+import requests
+
+USAGE = """Notify when an anime on your MAL On-Hold list has a finished English dub.
+
+  dub-watch setup      write the config (MAL username and client ID, optional AnimeSchedule token)
+  dub-watch auth       one-time MAL login for the "Move to Plan to Watch" button
+  dub-watch            check (at most once per day), notify on finished dubs
+  dub-watch --force    check even if already checked today
+  dub-watch --dry-run  print the status of every show, change nothing
+
+Finished: the show finished airing on MAL and MyDubList lists it as dubbed, not
+partial. With an AnimeSchedule token, a dub that is still releasing is held back, and
+the highest episode in AnimeSchedule's dub timetable must reach MAL's episode count.
+
+Config: ~/.config/dub-watch/config.json
+State:  ~/.local/state/dub-watch/state.json"""
+
+CONFIG_DIR = os.path.expanduser("~/.config/dub-watch")
+CONFIG = os.path.join(CONFIG_DIR, "config.json")
+TOKEN = os.path.join(CONFIG_DIR, "token.json")
+STATE = os.path.expanduser("~/.local/state/dub-watch/state.json")
+DEFAULT_CALLBACK_PORT = 8766
+MAL_API = "https://api.myanimelist.net/v2"
+MAL_OAUTH = "https://myanimelist.net/v1/oauth2"
+MYDUBLIST_DATA = "https://raw.githubusercontent.com/Joelis57/MyDubList/main/dubs"
+MYDUBLIST_CONFIDENCE = "normal"
+ANIMESCHEDULE_API = "https://animeschedule.net/api/v3"
+ANIMESCHEDULE_NO_DATE = "0001-01-01"
+USER_AGENT = {"User-Agent": "dub-watch/1.0"}
+
+
+def load(path, default):
+    try:
+        with open(path) as file:
+            return json.load(file)
+    except FileNotFoundError:
+        return default
+
+
+def save(path, data, private=False):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary_path = path + ".tmp"
+    with open(temporary_path, "w") as file:
+        json.dump(data, file, indent=2)
+    if private:
+        os.chmod(temporary_path, 0o600)
+    os.replace(temporary_path, path)
+
+
+def notify(title, body, action=None):
+    command = ["notify-send", "--app-name=Dub Watch", "--icon=video-television", title, body]
+    if not action:
+        subprocess.run(command)
+        return False
+    command[1:1] = ["--wait", "--expire-time=0", f"--action=go={action}"]
+    chosen_action = subprocess.run(command, capture_output=True, text=True).stdout.strip()
+    return chosen_action == "go"
+
+
+def on_hold(config):
+    shows, url = [], f"{MAL_API}/users/{config['username']}/animelist"
+    include_gray_rated_shows = {"nsfw": "true"}
+    params = {"status": "on_hold", "limit": 1000, "fields": "alternative_titles,num_episodes,status",
+              **include_gray_rated_shows}
+    while url:
+        response = requests.get(url, params=params, headers={"X-MAL-CLIENT-ID": config["client_id"], **USER_AGENT},
+                                timeout=30)
+        response.raise_for_status()
+        page = response.json()
+        shows += [entry["node"] for entry in page["data"]]
+        url, params = page.get("paging", {}).get("next"), None
+    return shows
+
+
+def token_request(config, **data):
+    data["client_id"] = config["client_id"]
+    if config.get("client_secret"):
+        data["client_secret"] = config["client_secret"]
+    response = requests.post(f"{MAL_OAUTH}/token", data=data, headers=USER_AGENT, timeout=30)
+    response.raise_for_status()
+    token = response.json()
+    token["expires_at"] = time.time() + token["expires_in"]
+    save(TOKEN, token, private=True)
+    return token
+
+
+def access_token(config):
+    token = load(TOKEN, None)
+    if not token:
+        return None
+    if token["expires_at"] - time.time() < 3600:
+        token = token_request(config, grant_type="refresh_token", refresh_token=token["refresh_token"])
+    return token["access_token"]
+
+
+def move_to_plan_to_watch(config, mal_id):
+    token = access_token(config)
+    if not token:
+        raise RuntimeError("not logged in, run: dub-watch auth")
+    response = requests.patch(f"{MAL_API}/anime/{mal_id}/my_list_status", data={"status": "plan_to_watch"},
+                              headers={"Authorization": f"Bearer {token}", **USER_AGENT}, timeout=30)
+    response.raise_for_status()
+
+
+def redirect_url(config):
+    return f"http://localhost:{config.get('callback_port', DEFAULT_CALLBACK_PORT)}/callback"
+
+
+def setup():
+    existing = load(CONFIG, {})
+
+    def ask(question, key, default=""):
+        current = existing.get(key, default)
+        answer = input(f"{question} [{current}]: " if current else f"{question}: ").strip()
+        return answer or current
+
+    config = {
+        "username": ask("MAL username", "username"),
+        "client_id": ask("MAL client ID", "client_id"),
+        "client_secret": ask("MAL client secret (leave empty for app type 'other')", "client_secret"),
+        "animeschedule_token": ask("AnimeSchedule application token (optional, Enter to skip)",
+                                   "animeschedule_token"),
+        "callback_port": int(ask("Login callback port", "callback_port", DEFAULT_CALLBACK_PORT)),
+    }
+    save(CONFIG, config, private=True)
+    print(f"Saved {CONFIG}. Your MAL app's redirect URL must be exactly: {redirect_url(config)}")
+    print("Next: dub-watch auth")
+
+
+def auth(config):
+    plain_pkce_verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).decode().rstrip("=")[:128]
+    state = secrets.token_urlsafe(16)
+    callback_params = {}
+
+    class CallbackHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            callback_params.update({name: values[0] for name, values in query.items()})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"Dub Watch: done, you can close this tab.")
+
+        def log_message(self, *arguments):
+            pass
+
+    server = http.server.HTTPServer(("localhost", config.get("callback_port", DEFAULT_CALLBACK_PORT)),
+                                    CallbackHandler)
+    threading.Thread(target=server.handle_request, daemon=True).start()
+    url = f"{MAL_OAUTH}/authorize?" + urllib.parse.urlencode({
+        "response_type": "code", "client_id": config["client_id"], "code_challenge": plain_pkce_verifier,
+        "code_challenge_method": "plain", "state": state, "redirect_uri": redirect_url(config)})
+    print("Opening MAL login in your browser. If it doesn't open, visit:\n" + url)
+    webbrowser.open(url)
+    for _ in range(300):
+        if callback_params:
+            break
+        time.sleep(1)
+    server.server_close()
+    if callback_params.get("state") != state or "code" not in callback_params:
+        sys.exit(f"Login failed: {callback_params or 'timed out'}")
+    token_request(config, grant_type="authorization_code", code=callback_params["code"],
+                  code_verifier=plain_pkce_verifier, redirect_uri=redirect_url(config))
+    print("Logged in. The Move to Plan to Watch button will work now.")
+
+
+def mydublist_english():
+    responses = [requests.get(f"{MYDUBLIST_DATA}/{path}", headers=USER_AGENT, timeout=30)
+                 for path in (f"confidence/{MYDUBLIST_CONFIDENCE}/dubbed_english.json", "counts/dubbed_english.json")]
+    for response in responses:
+        response.raise_for_status()
+    dubbed, counts = (response.json() for response in responses)
+    return set(dubbed["dubbed"]), set(counts.get("partial", []))
+
+
+class AnimeSchedule:
+    def __init__(self, token):
+        self.headers = {"Authorization": f"Bearer {token}", **USER_AGENT}
+        self.weeks = {}
+
+    def get(self, path, **params):
+        for _ in range(3):
+            response = requests.get(f"{ANIMESCHEDULE_API}/{path}", params=params, headers=self.headers, timeout=30)
+            limit_used_up = response.headers.get("x-ratelimit-remaining") == "0" or response.status_code == 429
+            if limit_used_up:
+                seconds_until_reset = int(response.headers.get("x-ratelimit-reset", time.time() + 60)) - time.time()
+                time.sleep(max(seconds_until_reset, 1))
+            if response.status_code != 429:
+                return response
+        return response
+
+    def dubbed_show(self, mal_id):
+        response = self.get("anime", **{"mal-ids": mal_id, "dub-exists": 1})
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()["anime"][0]
+
+    def dub_week(self, monday):
+        year, week, _ = monday.isocalendar()
+        if (year, week) not in self.weeks:
+            response = self.get("timetables/dub", year=year, week=week)
+            response.raise_for_status()
+            self.weeks[(year, week)] = response.json() or []
+        return self.weeks[(year, week)]
+
+
+def monday_of(day):
+    return day - timedelta(days=day.weekday())
+
+
+def scan_dub_timetable(anime_schedule, show, show_state, now):
+    premiere = show["dubPremier"][:10]
+    if premiere == ANIMESCHEDULE_NO_DATE:
+        return False
+    dub_upcoming = premiere > now.date().isoformat()
+    week_monday = monday_of(date.fromisoformat(show_state.get("scanned_from") or premiere))
+    this_monday = monday_of(now.date())
+    while week_monday <= this_monday:
+        for episode in anime_schedule.dub_week(week_monday):
+            if episode["route"] != show["route"]:
+                continue
+            if datetime.fromisoformat(episode["episodeDate"]) <= now:
+                show_state["dubbed_episodes"] = max(show_state.get("dubbed_episodes", 0), episode["episodeNumber"])
+            else:
+                dub_upcoming = True
+        week_monday += timedelta(weeks=1)
+    show_state["scanned_from"] = this_monday.isoformat()
+    return dub_upcoming
+
+
+def wait_for_network():
+    for _ in range(24):
+        try:
+            requests.head("https://api.myanimelist.net", timeout=5)
+            return
+        except requests.RequestException:
+            time.sleep(5)
+
+
+def check(config, force, dry_run):
+    state = load(STATE, {})
+    state.setdefault("notified", {})
+    state.setdefault("shows", {})
+    today = date.today().isoformat()
+    if state.get("last_run") == today and not force and not dry_run:
+        return
+    wait_for_network()
+    dubbed_ids, partial_ids = mydublist_english()
+    token = config.get("animeschedule_token")
+    anime_schedule = AnimeSchedule(token) if token else None
+    now = datetime.now(timezone.utc)
+    notifications, report = [], []
+    for anime in on_hold(config):
+        key = str(anime["id"])
+        title = anime.get("alternative_titles", {}).get("en") or anime["title"]
+        total_episodes = anime.get("num_episodes") or 0
+        if anime["id"] in partial_ids:
+            report.append(f"{title}: partial dub (MyDubList)")
+            continue
+        if anime["id"] not in dubbed_ids:
+            report.append(f"{title}: no dub")
+            continue
+        if anime.get("status") != "finished_airing":
+            report.append(f"{title}: dubbed, show still airing")
+            continue
+        dubbed_episodes = 0
+        show = anime_schedule.dubbed_show(anime["id"]) if anime_schedule else None
+        if show:
+            show_state = state["shows"].setdefault(key, {})
+            if scan_dub_timetable(anime_schedule, show, show_state, now):
+                report.append(f"{title}: dub still releasing ({show_state.get('dubbed_episodes', 0)} dubbed so far)")
+                continue
+            dubbed_episodes = show_state.get("dubbed_episodes", 0)
+        if dubbed_episodes and dubbed_episodes < total_episodes:
+            report.append(f"{title}: partial dub ({dubbed_episodes}/{total_episodes}, AnimeSchedule)")
+            continue
+        kind = "counted" if dubbed_episodes else "listed"
+        report.append(f"{title}: dub complete ({kind}, {dubbed_episodes or '?'}/{total_episodes})")
+        if key not in state["notified"]:
+            notifications.append((anime["id"], title, kind, total_episodes))
+            state["notified"][key] = kind
+    state["last_run"] = today
+    if dry_run:
+        print("\n".join(report))
+        for mal_id, title, kind, _ in notifications:
+            print(f"would notify: {mal_id} {title} ({kind})")
+        return
+    save(STATE, state)
+
+    def show_notification(mal_id, title, kind, total_episodes):
+        if kind == "counted":
+            body = f"All {total_episodes} episodes dubbed. Data: MyDubList (CC BY 4.0), AnimeSchedule.net"
+        else:
+            body = f"Listed as fully dubbed ({total_episodes} eps on MAL). Data: MyDubList (CC BY 4.0)"
+        if notify(f"Dub complete: {title}", body, "Move to Plan to Watch"):
+            try:
+                move_to_plan_to_watch(config, mal_id)
+                notify(f"Moved: {title}", "Now in Plan to Watch on MAL.")
+            except Exception as error:
+                notify(f"Move failed: {title}", str(error))
+
+    threads = [threading.Thread(target=show_notification, args=notification) for notification in notifications]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
+def main():
+    arguments = sys.argv[1:]
+    if {"-h", "--help"} & set(arguments):
+        print(USAGE)
+        return
+    if arguments[:1] == ["setup"]:
+        setup()
+        return
+    config = load(CONFIG, None)
+    if not config or not config.get("client_id"):
+        sys.exit("Not configured yet, run: dub-watch setup")
+    if arguments[:1] == ["auth"]:
+        auth(config)
+        return
+    try:
+        check(config, "--force" in arguments, "--dry-run" in arguments)
+    except requests.RequestException as error:
+        if "--dry-run" in arguments or sys.stdin.isatty():
+            raise
+        notify("Dub Watch check failed", str(error))
+
+
+if __name__ == "__main__":
+    main()

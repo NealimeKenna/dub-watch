@@ -1,0 +1,11 @@
+[Unit]
+Description=Notify about finished English dubs on the MAL On-Hold list
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/dub-watch
+Nice=10
+
+[Install]
+WantedBy=graphical-session.target
